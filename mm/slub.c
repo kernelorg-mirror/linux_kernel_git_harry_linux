@@ -422,7 +422,6 @@ struct slab_sheaf {
 			bool pfmemalloc;
 		};
 	};
-	struct kmem_cache *cache;
 	unsigned int size;
 	int node; /* only used for rcu_sheaf */
 	void *objects[];
@@ -2781,8 +2780,6 @@ static struct slab_sheaf *__alloc_empty_sheaf(struct kmem_cache *s, gfp_t gfp,
 	if (unlikely(!sheaf))
 		return NULL;
 
-	sheaf->cache = s;
-
 	stat(s, SHEAF_ALLOC);
 
 	return sheaf;
@@ -2802,13 +2799,14 @@ static void free_empty_sheaf(struct kmem_cache *s, struct slab_sheaf *sheaf)
 	 * warning, therefore replace NULL with CODETAG_EMPTY to indicate
 	 * that the extension for this sheaf is expected to be NULL.
 	 */
-	if (s->flags & SLAB_KMALLOC)
+	if (s && (s->flags & SLAB_KMALLOC))
 		mark_obj_codetag_empty(sheaf);
 
 	VM_WARN_ON_ONCE(sheaf->size > 0);
 	kfree(sheaf);
 
-	stat(s, SHEAF_FREE);
+	if (s)
+		stat(s, SHEAF_FREE);
 }
 
 static unsigned int
@@ -2968,12 +2966,15 @@ static void rcu_free_sheaf_nobarn(struct rcu_head *head)
 	struct kmem_cache *s;
 
 	sheaf = container_of(head, struct slab_sheaf, rcu_head);
-	s = sheaf->cache;
+	if (WARN_ON_ONCE(!sheaf->size)) {
+		free_empty_sheaf(NULL, sheaf);
+		return;
+	}
 
+	s = virt_to_slab(sheaf->objects[0])->slab_cache;
 	__rcu_free_sheaf_prepare(s, sheaf);
 
 	sheaf_flush_unused(s, sheaf);
-
 	free_empty_sheaf(s, sheaf);
 }
 
@@ -5019,7 +5020,6 @@ kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned int size)
 			return NULL;
 
 		stat(s, SHEAF_PREFILL_OVERSIZE);
-		sheaf->cache = s;
 		sheaf->capacity = size;
 
 		/*
@@ -5873,8 +5873,12 @@ static void rcu_free_sheaf(struct rcu_head *head)
 	struct kmem_cache *s;
 
 	sheaf = container_of(head, struct slab_sheaf, rcu_head);
+	if (WARN_ON_ONCE(!sheaf->size)) {
+		free_empty_sheaf(NULL, sheaf);
+		return;
+	}
 
-	s = sheaf->cache;
+	s = virt_to_slab(sheaf->objects[0])->slab_cache;
 
 	/*
 	 * This may remove some objects due to slab_free_hook() returning false,
@@ -7615,10 +7619,6 @@ static int init_percpu_sheaves(struct kmem_cache *s)
 		 * s->cpu_sheaves and pcs->main always exists and are valid.
 		 * It's also safe to share the single static bootstrap_sheaf
 		 * with zero-sized objects array as it's never modified.
-		 *
-		 * Bootstrap_sheaf also has NULL pointer to kmem_cache so we
-		 * recognize it and not attempt to free it when destroying the
-		 * cache.
 		 *
 		 * We keep bootstrap_sheaf for kmem_cache and kmem_cache_node,
 		 * caches with debug enabled, and all caches with SLUB_TINY.
