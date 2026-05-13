@@ -417,11 +417,9 @@ struct slab_sheaf {
 		struct rcu_head rcu_head;
 		struct list_head barn_list;
 		/* only used for prefilled sheafs */
-		struct {
-			unsigned short capacity;
-			bool pfmemalloc;
-		};
+		bool pfmemalloc;
 	};
+	unsigned short capacity;
 	unsigned short size;
 	int node; /* only used for rcu_sheaf */
 	void *objects[];
@@ -2780,6 +2778,8 @@ static struct slab_sheaf *__alloc_empty_sheaf(struct kmem_cache *s, gfp_t gfp,
 	if (unlikely(!sheaf))
 		return NULL;
 
+	sheaf->capacity = capacity;
+
 	stat(s, SHEAF_ALLOC);
 
 	return sheaf;
@@ -2816,7 +2816,7 @@ refill_objects(struct kmem_cache *s, void **p, gfp_t gfp, unsigned int min,
 static int refill_sheaf(struct kmem_cache *s, struct slab_sheaf *sheaf,
 			 gfp_t gfp)
 {
-	int to_fill = s->sheaf_capacity - sheaf->size;
+	int to_fill = sheaf->capacity - sheaf->size;
 	int filled;
 
 	if (!to_fill)
@@ -5063,7 +5063,6 @@ kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned short size)
 		sheaf = alloc_empty_sheaf(s, gfp);
 
 	if (sheaf) {
-		sheaf->capacity = s->sheaf_capacity;
 		sheaf->pfmemalloc = false;
 
 		if (sheaf->size < size &&
@@ -5688,13 +5687,13 @@ static void __pcs_install_empty_sheaf(struct kmem_cache *s,
 	 * Unlikely because if the main sheaf had space, we would have just
 	 * freed to it. Get rid of our empty sheaf.
 	 */
-	if (pcs->main->size < s->sheaf_capacity) {
+	if (pcs->main->size < pcs->main->capacity) {
 		barn_put_empty_sheaf(barn, empty);
 		return;
 	}
 
 	/* Also unlikely for the same reason */
-	if (pcs->spare->size < s->sheaf_capacity) {
+	if (pcs->spare->size < pcs->spare->capacity) {
 		swap(pcs->main, pcs->spare);
 		barn_put_empty_sheaf(barn, empty);
 		return;
@@ -5752,7 +5751,7 @@ restart:
 		goto alloc_empty;
 	}
 
-	if (pcs->spare->size < s->sheaf_capacity) {
+	if (pcs->spare->size < pcs->spare->capacity) {
 		swap(pcs->main, pcs->spare);
 		return pcs;
 	}
@@ -5819,7 +5818,7 @@ alloc_empty:
 	 * but in case we got preempted or migrated, we need to
 	 * check again
 	 */
-	if (pcs->main->size == s->sheaf_capacity)
+	if (pcs->main->size == pcs->main->capacity)
 		goto restart;
 
 	return pcs;
@@ -5850,7 +5849,7 @@ bool free_to_pcs(struct kmem_cache *s, void *object, bool allow_spin)
 
 	pcs = this_cpu_ptr(s->cpu_sheaves);
 
-	if (unlikely(pcs->main->size == s->sheaf_capacity)) {
+	if (unlikely(pcs->main->size == pcs->main->capacity)) {
 
 		pcs = __pcs_replace_full_main(s, pcs, allow_spin);
 		if (unlikely(!pcs))
@@ -6015,7 +6014,7 @@ do_free:
 	 */
 	rcu_sheaf->objects[rcu_sheaf->size++] = obj;
 
-	if (likely(rcu_sheaf->size < s->sheaf_capacity)) {
+	if (likely(rcu_sheaf->size < rcu_sheaf->capacity)) {
 		rcu_sheaf = NULL;
 	} else {
 		pcs->rcu_free = NULL;
@@ -6139,7 +6138,7 @@ next_batch:
 
 	pcs = this_cpu_ptr(s->cpu_sheaves);
 
-	if (likely(pcs->main->size < s->sheaf_capacity))
+	if (likely(pcs->main->size < pcs->main->capacity))
 		goto do_free;
 
 	barn = get_barn(s);
@@ -6156,7 +6155,7 @@ next_batch:
 		goto do_free;
 	}
 
-	if (pcs->spare->size < s->sheaf_capacity) {
+	if (pcs->spare->size < pcs->spare->capacity) {
 		swap(pcs->main, pcs->spare);
 		goto do_free;
 	}
@@ -6172,7 +6171,7 @@ next_batch:
 
 do_free:
 	main = pcs->main;
-	batch = min_t(size_t, size, s->sheaf_capacity - main->size);
+	batch = min_t(size_t, size, main->capacity - main->size);
 
 	memcpy(main->objects + main->size, p, batch * sizeof(void *));
 	main->size += batch;
@@ -7613,7 +7612,7 @@ static int init_percpu_sheaves(struct kmem_cache *s)
 
 		/*
 		 * Bootstrap sheaf has zero size so fast-path allocation fails.
-		 * It has also size == s->sheaf_capacity, so fast-path free
+		 * It has also size == sheaf->capacity, so fast-path free
 		 * fails. In the slow paths we recognize the situation by
 		 * checking s->sheaf_capacity. This allows fast paths to assume
 		 * s->cpu_sheaves and pcs->main always exists and are valid.
