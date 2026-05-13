@@ -205,6 +205,8 @@ struct kmem_cache {
 	struct reciprocal_value reciprocal_size;
 	unsigned int offset;		/* Free pointer offset */
 	unsigned short sheaf_capacity;
+	unsigned short max_full_sheaves;
+	unsigned short max_empty_sheaves;
 	struct kmem_cache_order_objects oo;
 
 	/* Allocation and freeing of slabs */

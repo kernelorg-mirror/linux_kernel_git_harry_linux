@@ -396,9 +396,6 @@ void stat_add(const struct kmem_cache *s, enum stat_item si, int v)
 #endif
 }
 
-#define MAX_FULL_SHEAVES	10
-#define MAX_EMPTY_SHEAVES	10
-
 struct node_barn {
 	spinlock_t lock;
 	struct list_head sheaves_full;
@@ -3287,7 +3284,7 @@ barn_replace_full_sheaf(struct kmem_cache *s, struct node_barn *barn,
 	lockdep_assert_held(this_cpu_ptr(&s->cpu_sheaves->lock));
 
 	/* we don't repeat this check under barn->lock as it's not critical */
-	if (data_race(barn->nr_full) >= MAX_FULL_SHEAVES)
+	if (data_race(barn->nr_full) >= s->max_full_sheaves)
 		return ERR_PTR(-E2BIG);
 	if (!data_race(barn->nr_empty))
 		return ERR_PTR(-ENOMEM);
@@ -5251,7 +5248,7 @@ void kmem_cache_return_sheaf(struct kmem_cache *s, gfp_t gfp,
 	 * If the barn has too many full sheaves or we fail to refill the sheaf,
 	 * simply flush and free it.
 	 */
-	if (!barn || data_race(barn->nr_full) >= MAX_FULL_SHEAVES) {
+	if (!barn || data_race(barn->nr_full) >= s->max_full_sheaves) {
 		local_unlock(&s->cpu_sheaves->lock);
 		goto free_sheaf;
 	}
@@ -6072,7 +6069,7 @@ static void rcu_free_sheaf(struct rcu_head *head)
 	 * limit but that should be rare and harmless.
 	 */
 
-	if (data_race(barn->nr_full) < MAX_FULL_SHEAVES) {
+	if (data_race(barn->nr_full) < s->max_full_sheaves) {
 		stat(s, BARN_PUT);
 		barn_put_full_sheaf(s, barn, sheaf);
 		local_unlock(&s->cpu_sheaves->lock);
@@ -6083,7 +6080,7 @@ static void rcu_free_sheaf(struct rcu_head *head)
 	sheaf_flush_unused(s, sheaf);
 
 empty:
-	if (barn && data_race(barn->nr_empty) < MAX_EMPTY_SHEAVES) {
+	if (barn && data_race(barn->nr_empty) < s->max_empty_sheaves) {
 		barn_put_empty_sheaf(s, barn, sheaf);
 		local_unlock(&s->cpu_sheaves->lock);
 		return;
@@ -8843,6 +8840,8 @@ int do_kmem_cache_create(struct kmem_cache *s, const char *name,
 #endif
 	s->align = args->align;
 	s->ctor = args->ctor;
+	s->max_full_sheaves = 10;
+	s->max_empty_sheaves = 10;
 #ifdef CONFIG_HARDENED_USERCOPY
 	s->useroffset = args->useroffset;
 	s->usersize = args->usersize;
@@ -9359,6 +9358,46 @@ static ssize_t sheaf_capacity_store(struct kmem_cache *s,
 }
 SLAB_ATTR(sheaf_capacity);
 
+static ssize_t max_full_sheaves_show(struct kmem_cache *s, char *buf)
+{
+	return sysfs_emit(buf, "%hu\n", s->max_full_sheaves);
+}
+
+static ssize_t max_full_sheaves_store(struct kmem_cache *s, const char *buf,
+				      size_t length)
+{
+	unsigned short max_full_sheaves;
+	int err;
+
+	err = kstrtou16(buf, 10, &max_full_sheaves);
+	if (err)
+		return err;
+
+	s->max_full_sheaves = max_full_sheaves;
+	return length;
+}
+SLAB_ATTR(max_full_sheaves);
+
+static ssize_t max_empty_sheaves_show(struct kmem_cache *s, char *buf)
+{
+	return sysfs_emit(buf, "%hu\n", s->max_empty_sheaves);
+}
+
+static ssize_t max_empty_sheaves_store(struct kmem_cache *s, const char *buf,
+				       size_t length)
+{
+	unsigned short max_empty_sheaves;
+	int err;
+
+	err = kstrtou16(buf, 10, &max_empty_sheaves);
+	if (err)
+		return err;
+
+	s->max_empty_sheaves = max_empty_sheaves;
+	return length;
+}
+SLAB_ATTR(max_empty_sheaves);
+
 static ssize_t min_partial_show(struct kmem_cache *s, char *buf)
 {
 	return sysfs_emit(buf, "%lu\n", s->min_partial);
@@ -9721,6 +9760,8 @@ static const struct attribute *const slab_attrs[] = {
 	&objs_per_slab_attr.attr,
 	&order_attr.attr,
 	&sheaf_capacity_attr.attr,
+	&max_full_sheaves_attr.attr,
+	&max_empty_sheaves_attr.attr,
 	&min_partial_attr.attr,
 	&cpu_partial_attr.attr,
 	&objects_partial_attr.attr,
