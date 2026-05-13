@@ -252,7 +252,7 @@ __kmem_cache_create_args(const char *name, unsigned int size,
 }
 
 struct slab_sheaf *
-kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned int size)
+kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned short size)
 {
 	struct slab_sheaf *sheaf;
 	unsigned int capacity;
@@ -281,7 +281,7 @@ kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned int size)
 }
 
 int kmem_cache_refill_sheaf(struct kmem_cache *s, gfp_t gfp,
-		 struct slab_sheaf **sheafp, unsigned int size)
+		 struct slab_sheaf **sheafp, unsigned short size)
 {
 	struct slab_sheaf *sheaf = *sheafp;
 	int refill;

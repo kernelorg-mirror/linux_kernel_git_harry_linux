@@ -371,7 +371,7 @@ struct kmem_cache_args {
 	 *
 	 * %0 means no sheaves will be created.
 	 */
-	unsigned int sheaf_capacity;
+	unsigned short sheaf_capacity;
 };
 
 struct kmem_cache *__kmem_cache_create_args(const char *name,
@@ -828,10 +828,10 @@ void *kmem_cache_alloc_node_noprof(struct kmem_cache *s, gfp_t flags,
 #define kmem_cache_alloc_node(...)	alloc_hooks(kmem_cache_alloc_node_noprof(__VA_ARGS__))
 
 struct slab_sheaf *
-kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned int size);
+kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned short size);
 
 int kmem_cache_refill_sheaf(struct kmem_cache *s, gfp_t gfp,
-		struct slab_sheaf **sheafp, unsigned int size);
+		struct slab_sheaf **sheafp, unsigned short size);
 
 void kmem_cache_return_sheaf(struct kmem_cache *s, gfp_t gfp,
 				       struct slab_sheaf *sheaf);
@@ -841,7 +841,7 @@ void *kmem_cache_alloc_from_sheaf_noprof(struct kmem_cache *cachep, gfp_t gfp,
 #define kmem_cache_alloc_from_sheaf(...)	\
 			alloc_hooks(kmem_cache_alloc_from_sheaf_noprof(__VA_ARGS__))
 
-unsigned int kmem_cache_sheaf_size(struct slab_sheaf *sheaf);
+unsigned short kmem_cache_sheaf_size(struct slab_sheaf *sheaf);
 
 /*
  * These macros allow declaring a kmem_buckets * parameter alongside size, which

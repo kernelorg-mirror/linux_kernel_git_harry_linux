@@ -418,11 +418,11 @@ struct slab_sheaf {
 		struct list_head barn_list;
 		/* only used for prefilled sheafs */
 		struct {
-			unsigned int capacity;
+			unsigned short capacity;
 			bool pfmemalloc;
 		};
 	};
-	unsigned int size;
+	unsigned short size;
 	int node; /* only used for rcu_sheaf */
 	void *objects[];
 };
@@ -2756,7 +2756,7 @@ static inline void *setup_object(struct kmem_cache *s, void *object)
 }
 
 static struct slab_sheaf *__alloc_empty_sheaf(struct kmem_cache *s, gfp_t gfp,
-					      unsigned int capacity)
+					      unsigned short capacity)
 {
 	struct slab_sheaf *sheaf;
 	size_t sheaf_size;
@@ -2854,10 +2854,10 @@ static void __kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p);
  *
  * Returns how many objects are remaining to be flushed
  */
-static unsigned int __sheaf_flush_main_batch(struct kmem_cache *s)
+static unsigned short __sheaf_flush_main_batch(struct kmem_cache *s)
 {
 	struct slub_percpu_sheaves *pcs;
-	unsigned int batch, remaining;
+	unsigned short batch, remaining;
 	void *objects[PCS_BATCH_MAX];
 	struct slab_sheaf *sheaf;
 
@@ -2884,7 +2884,7 @@ static unsigned int __sheaf_flush_main_batch(struct kmem_cache *s)
 
 static void sheaf_flush_main(struct kmem_cache *s)
 {
-	unsigned int remaining;
+	unsigned short remaining;
 
 	do {
 		local_lock(&s->cpu_sheaves->lock);
@@ -2899,7 +2899,7 @@ static void sheaf_flush_main(struct kmem_cache *s)
  */
 static bool sheaf_try_flush_main(struct kmem_cache *s)
 {
-	unsigned int remaining;
+	unsigned short remaining;
 	bool ret = false;
 
 	do {
@@ -4849,7 +4849,7 @@ next_batch:
 do_alloc:
 
 	main = pcs->main;
-	batch = min(size, main->size);
+	batch = min_t(size_t, size, main->size);
 
 	main->size -= batch;
 	memcpy(p, main->objects + main->size, batch * sizeof(void *));
@@ -5004,7 +5004,7 @@ static int __kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags,
  * return NULL if sheaf allocation or prefilling failed
  */
 struct slab_sheaf *
-kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned int size)
+kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned short size)
 {
 	struct slub_percpu_sheaves *pcs;
 	struct slab_sheaf *sheaf = NULL;
@@ -5146,7 +5146,7 @@ void kmem_cache_return_sheaf(struct kmem_cache *s, gfp_t gfp,
  * In practice we always refill to full sheaf's capacity.
  */
 int kmem_cache_refill_sheaf(struct kmem_cache *s, gfp_t gfp,
-			    struct slab_sheaf **sheafp, unsigned int size)
+			    struct slab_sheaf **sheafp, unsigned short size)
 {
 	struct slab_sheaf *sheaf;
 
@@ -5225,7 +5225,7 @@ out:
 	return ret;
 }
 
-unsigned int kmem_cache_sheaf_size(struct slab_sheaf *sheaf)
+unsigned short kmem_cache_sheaf_size(struct slab_sheaf *sheaf)
 {
 	return sheaf->size;
 }
@@ -6172,7 +6172,7 @@ next_batch:
 
 do_free:
 	main = pcs->main;
-	batch = min(size, s->sheaf_capacity - main->size);
+	batch = min_t(size_t, size, s->sheaf_capacity - main->size);
 
 	memcpy(main->objects + main->size, p, batch * sizeof(void *));
 	main->size += batch;
@@ -7759,11 +7759,11 @@ static int init_kmem_cache_nodes(struct kmem_cache *s)
 	return 1;
 }
 
-static unsigned int calculate_sheaf_capacity(struct kmem_cache *s,
-					     struct kmem_cache_args *args)
+static unsigned short calculate_sheaf_capacity(struct kmem_cache *s,
+					       struct kmem_cache_args *args)
 
 {
-	unsigned int capacity;
+	unsigned short capacity;
 	size_t size;
 
 
@@ -8466,7 +8466,7 @@ static struct kmem_cache * __init bootstrap(struct kmem_cache *static_cache)
 static void __init bootstrap_cache_sheaves(struct kmem_cache *s)
 {
 	struct kmem_cache_args empty_args = {};
-	unsigned int capacity;
+	unsigned short capacity;
 	bool failed = false;
 	int node, cpu;
 
@@ -9091,7 +9091,7 @@ SLAB_ATTR_RO(order);
 
 static ssize_t sheaf_capacity_show(struct kmem_cache *s, char *buf)
 {
-	return sysfs_emit(buf, "%u\n", s->sheaf_capacity);
+	return sysfs_emit(buf, "%hu\n", s->sheaf_capacity);
 }
 SLAB_ATTR_RO(sheaf_capacity);
 

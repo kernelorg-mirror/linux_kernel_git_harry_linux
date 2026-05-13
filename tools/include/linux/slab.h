@@ -47,7 +47,7 @@ struct kmem_cache {
 	pthread_mutex_t lock;
 	unsigned int size;
 	unsigned int align;
-	unsigned int sheaf_capacity;
+	unsigned short sheaf_capacity;
 	int nr_objs;
 	void *objs;
 	void (*ctor)(void *);
@@ -70,7 +70,7 @@ struct kmem_cache_args {
 	/**
 	 * @sheaf_capacity: The maximum size of the sheaf.
 	 */
-	unsigned int sheaf_capacity;
+	unsigned short sheaf_capacity;
 	/**
 	 * @useroffset: Usercopy region offset.
 	 *
@@ -127,10 +127,10 @@ struct slab_sheaf {
 	union {
 		struct list_head barn_list;
 		/* only used for prefilled sheafs */
-		unsigned int capacity;
+		unsigned short capacity;
 	};
 	struct kmem_cache *cache;
-	unsigned int size;
+	unsigned short size;
 	int node; /* only used for rcu_sheaf */
 	void *objects[];
 };
@@ -186,7 +186,7 @@ void kmem_cache_free_bulk(struct kmem_cache *cachep, size_t size, void **list);
 int kmem_cache_alloc_bulk(struct kmem_cache *cachep, gfp_t gfp, size_t size,
 			  void **list);
 struct slab_sheaf *
-kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned int size);
+kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned short size);
 
 void *
 kmem_cache_alloc_from_sheaf(struct kmem_cache *s, gfp_t gfp,
@@ -195,9 +195,9 @@ kmem_cache_alloc_from_sheaf(struct kmem_cache *s, gfp_t gfp,
 void kmem_cache_return_sheaf(struct kmem_cache *s, gfp_t gfp,
 		struct slab_sheaf *sheaf);
 int kmem_cache_refill_sheaf(struct kmem_cache *s, gfp_t gfp,
-		struct slab_sheaf **sheafp, unsigned int size);
+		struct slab_sheaf **sheafp, unsigned short size);
 
-static inline unsigned int kmem_cache_sheaf_size(struct slab_sheaf *sheaf)
+static inline unsigned short kmem_cache_sheaf_size(struct slab_sheaf *sheaf)
 {
 	return sheaf->size;
 }
