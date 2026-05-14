@@ -238,11 +238,6 @@ struct slab_obj_iter {
 #endif
 };
 
-static inline bool kmem_cache_debug(struct kmem_cache *s)
-{
-	return kmem_cache_debug_flags(s, SLAB_DEBUG_FLAGS);
-}
-
 void *fixup_red_left(struct kmem_cache *s, void *p)
 {
 	if (kmem_cache_debug_flags(s, SLAB_RED_ZONE))
@@ -431,6 +426,23 @@ struct slub_percpu_sheaves {
 	struct slab_sheaf *spare; /* empty or full, may be NULL */
 	struct slab_sheaf *rcu_free; /* for batching kfree_rcu() */
 };
+
+static struct slab_sheaf bootstrap_sheaf = {};
+
+static inline bool pcs_has_sheaves_unlocked(struct slub_percpu_sheaves *pcs)
+{
+	/* Test CONFIG_SLUB_TINY for code elimination purposes */
+	if (IS_ENABLED(CONFIG_SLUB_TINY))
+		return false;
+
+	return unlikely(pcs->main != &bootstrap_sheaf);
+}
+
+static inline bool pcs_has_sheaves(struct slub_percpu_sheaves *pcs)
+{
+	lockdep_assert_held(&pcs->lock);
+	return pcs_has_sheaves_unlocked(pcs);
+}
 
 /*
  * The slab lists for all objects.
@@ -3045,8 +3057,7 @@ static void pcs_destroy(struct kmem_cache *s)
 	if (!s->cpu_sheaves)
 		return;
 
-	/* pcs->main can only point to the bootstrap sheaf, nothing to free */
-	if (!cache_has_sheaves(s))
+	if (!cache_supports_sheaves(s))
 		goto free_pcs;
 
 	for_each_possible_cpu(cpu) {
@@ -3056,6 +3067,9 @@ static void pcs_destroy(struct kmem_cache *s)
 
 		/* This can happen when unwinding failed cache creation. */
 		if (!pcs->main)
+			continue;
+
+		if (!pcs_has_sheaves_unlocked(pcs))
 			continue;
 
 		/*
@@ -3949,7 +3963,7 @@ static bool has_pcs_used(int cpu, struct kmem_cache *s)
 {
 	struct slub_percpu_sheaves *pcs;
 
-	if (!cache_has_sheaves(s))
+	if (!cache_supports_sheaves(s))
 		return false;
 
 	pcs = per_cpu_ptr(s->cpu_sheaves, cpu);
@@ -3971,7 +3985,7 @@ static void flush_cpu_sheaves(struct work_struct *w)
 
 	s = sfw->s;
 
-	if (cache_has_sheaves(s))
+	if (cache_supports_sheaves(s))
 		pcs_flush_all(s);
 }
 
@@ -4074,7 +4088,7 @@ void flush_all_rcu_sheaves(void)
 	mutex_lock(&slab_mutex);
 
 	list_for_each_entry(s, &slab_caches, list) {
-		if (!cache_has_sheaves(s))
+		if (!cache_supports_sheaves(s))
 			continue;
 		flush_rcu_sheaves_on_cache(s);
 	}
@@ -4109,7 +4123,7 @@ static int slub_cpu_setup(unsigned int cpu)
 		/*
 		 * barn might already exist if a previous callback failed midway
 		 */
-		if (!cache_has_sheaves(s) || get_barn_node(s, nid))
+		if (!cache_supports_sheaves(s) || get_barn_node(s, nid))
 			continue;
 
 		barn = kmalloc_node(sizeof(*barn), GFP_KERNEL, nid);
@@ -4140,7 +4154,7 @@ static int slub_cpu_dead(unsigned int cpu)
 
 	mutex_lock(&slab_mutex);
 	list_for_each_entry(s, &slab_caches, list) {
-		if (cache_has_sheaves(s))
+		if (cache_supports_sheaves(s))
 			__pcs_flush_all_cpu(s, cpu);
 	}
 	mutex_unlock(&slab_mutex);
@@ -4612,8 +4626,8 @@ __pcs_replace_empty_main(struct kmem_cache *s, struct slub_percpu_sheaves *pcs, 
 
 	lockdep_assert_held(this_cpu_ptr(&s->cpu_sheaves->lock));
 
-	/* Bootstrap or debug cache, back off */
-	if (unlikely(!cache_has_sheaves(s))) {
+	/* Sheaves are not supported or disabled for this cache */
+	if (unlikely(!pcs_has_sheaves(pcs))) {
 		local_unlock(&s->cpu_sheaves->lock);
 		return NULL;
 	}
@@ -4809,7 +4823,7 @@ next_batch:
 		struct slab_sheaf *full;
 		struct node_barn *barn;
 
-		if (unlikely(!cache_has_sheaves(s))) {
+		if (unlikely(!pcs_has_sheaves(pcs))) {
 			local_unlock(&s->cpu_sheaves->lock);
 			return allocated;
 		}
@@ -5727,8 +5741,8 @@ __pcs_replace_full_main(struct kmem_cache *s, struct slub_percpu_sheaves *pcs,
 restart:
 	lockdep_assert_held(this_cpu_ptr(&s->cpu_sheaves->lock));
 
-	/* Bootstrap or debug cache, back off */
-	if (unlikely(!cache_has_sheaves(s))) {
+	/* Sheaves are not supported or disabled for this cache */
+	if (unlikely(!pcs_has_sheaves(pcs))) {
 		local_unlock(&s->cpu_sheaves->lock);
 		return NULL;
 	}
@@ -5959,8 +5973,8 @@ bool __kfree_rcu_sheaf(struct kmem_cache *s, void *obj)
 		struct slab_sheaf *empty;
 		struct node_barn *barn;
 
-		/* Bootstrap or debug cache, fall back */
-		if (unlikely(!cache_has_sheaves(s))) {
+		/* Sheaves are not supported or disabled for this cache */
+		if (unlikely(!pcs_has_sheaves(pcs))) {
 			local_unlock(&s->cpu_sheaves->lock);
 			goto fail;
 		}
@@ -6137,6 +6151,11 @@ next_batch:
 		goto fallback;
 
 	pcs = this_cpu_ptr(s->cpu_sheaves);
+
+	if (unlikely(!pcs_has_sheaves(pcs))) {
+		local_unlock(&s->cpu_sheaves->lock);
+		goto fallback;
+	}
 
 	if (likely(pcs->main->size < pcs->main->capacity))
 		goto do_free;
@@ -7131,7 +7150,7 @@ void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
 	 * freeing to sheaves is so incompatible with the detached freelist so
 	 * once we go that way, we have to do everything differently
 	 */
-	if (s && cache_has_sheaves(s)) {
+	if (s && cache_supports_sheaves(s)) {
 		free_to_pcs_bulk(s, size, p);
 		return;
 	}
@@ -7600,7 +7619,6 @@ static inline int alloc_kmem_cache_stats(struct kmem_cache *s)
 
 static int init_percpu_sheaves(struct kmem_cache *s)
 {
-	static struct slab_sheaf bootstrap_sheaf = {};
 	int cpu;
 
 	for_each_possible_cpu(cpu) {
@@ -7614,7 +7632,7 @@ static int init_percpu_sheaves(struct kmem_cache *s)
 		 * Bootstrap sheaf has zero size so fast-path allocation fails.
 		 * It has also size == sheaf->capacity, so fast-path free
 		 * fails. In the slow paths we recognize the situation by
-		 * checking s->sheaf_capacity. This allows fast paths to assume
+		 * pcs_has_sheaves(). This allows fast paths to assume
 		 * s->cpu_sheaves and pcs->main always exists and are valid.
 		 * It's also safe to share the single static bootstrap_sheaf
 		 * with zero-sized objects array as it's never modified.
@@ -7631,6 +7649,7 @@ static int init_percpu_sheaves(struct kmem_cache *s)
 
 		if (!pcs->main)
 			return -ENOMEM;
+
 	}
 
 	return 0;
@@ -7740,7 +7759,11 @@ static int init_kmem_cache_nodes(struct kmem_cache *s)
 		s->per_node[node].node = n;
 	}
 
-	if (slab_state == DOWN || !cache_has_sheaves(s))
+	if (slab_state == DOWN || !cache_supports_sheaves(s))
+		return 1;
+
+	/* Enable sheaves later to avoid the chicken and egg problem */
+	if (is_kmalloc_normal(s))
 		return 1;
 
 	for_each_node_mask(node, slab_barn_nodes) {
@@ -7765,17 +7788,7 @@ static unsigned short calculate_sheaf_capacity(struct kmem_cache *s,
 	unsigned short capacity;
 	size_t size;
 
-
-	if (IS_ENABLED(CONFIG_SLUB_TINY) || s->flags & SLAB_DEBUG_FLAGS)
-		return 0;
-
-	/*
-	 * Bootstrap caches can't have sheaves for now (SLAB_NO_OBJ_EXT).
-	 * SLAB_NOLEAKTRACE caches (e.g., kmemleak's object_cache) must not
-	 * have sheaves to avoid recursion when sheaf allocation triggers
-	 * kmemleak tracking.
-	 */
-	if (s->flags & (SLAB_NO_OBJ_EXT | SLAB_NOLEAKTRACE))
+	if (!cache_supports_sheaves(s))
 		return 0;
 
 	/*
@@ -8040,7 +8053,7 @@ int __kmem_cache_shutdown(struct kmem_cache *s)
 	flush_all_cpus_locked(s);
 
 	/* we might have rcu sheaves in flight */
-	if (cache_has_sheaves(s))
+	if (cache_supports_sheaves(s))
 		rcu_barrier();
 
 	for_each_node(node) {
@@ -8361,7 +8374,7 @@ static int slab_mem_going_online_callback(int nid)
 		if (get_node(s, nid))
 			continue;
 
-		if (cache_has_sheaves(s) && !get_barn_node(s, nid)) {
+		if (cache_supports_sheaves(s) && !get_barn_node(s, nid)) {
 
 			barn = kmalloc_node(sizeof(*barn), GFP_KERNEL, nid);
 

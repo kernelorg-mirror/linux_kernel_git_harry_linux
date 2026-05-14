@@ -2109,7 +2109,7 @@ EXPORT_SYMBOL_GPL(kvfree_rcu_barrier);
  */
 void kvfree_rcu_barrier_on_cache(struct kmem_cache *s)
 {
-	if (cache_has_sheaves(s)) {
+	if (cache_supports_sheaves(s)) {
 		flush_rcu_sheaves_on_cache(s);
 		rcu_barrier();
 	}

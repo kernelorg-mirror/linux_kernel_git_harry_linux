@@ -481,6 +481,42 @@ static inline bool kmem_cache_debug_flags(struct kmem_cache *s, slab_flags_t fla
 	return false;
 }
 
+static inline bool kmem_cache_debug(struct kmem_cache *s)
+{
+	return kmem_cache_debug_flags(s, SLAB_DEBUG_FLAGS);
+}
+
+/*
+ * Every cache has !NULL s->cpu_sheaves but they may point to the
+ * bootstrap_sheaf temporarily during init, or permanently for the boot caches
+ * and caches with debugging enabled, or all caches with CONFIG_SLUB_TINY. This
+ * helper distinguishes whether cache supports real non-bootstrap sheaves.
+ *
+ * Return false when the cache does not support sheaves.
+ *
+ * When it returns true, the cache may or may not have sheaves.
+ * Callers who access percpu sheaves must verify that they actually have
+ * sheaves enabled.
+ */
+static inline bool cache_supports_sheaves(struct kmem_cache *s)
+{
+	if (IS_ENABLED(CONFIG_SLUB_TINY))
+		return false;
+
+	if (kmem_cache_debug(s))
+		return false;
+	/*
+	 * Bootstrap caches can't have sheaves for now (SLAB_NO_OBJ_EXT).
+	 * SLAB_NOLEAKTRACE caches (e.g., kmemleak's object_cache) must not
+	 * have sheaves to avoid recursion when sheaf allocation triggers
+	 * kmemleak tracking.
+	 */
+	if (s->flags & (SLAB_NO_OBJ_EXT | SLAB_NOLEAKTRACE))
+		return false;
+
+	return true;
+}
+
 #if IS_ENABLED(CONFIG_SLUB_DEBUG) && IS_ENABLED(CONFIG_KUNIT)
 bool slab_in_kunit_test(void);
 #else
