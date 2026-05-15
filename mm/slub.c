@@ -425,6 +425,7 @@ struct slub_percpu_sheaves {
 	struct slab_sheaf *main; /* never NULL when unlocked */
 	struct slab_sheaf *spare; /* empty or full, may be NULL */
 	struct slab_sheaf *rcu_free; /* for batching kfree_rcu() */
+	unsigned short capacity;
 };
 
 static struct slab_sheaf bootstrap_sheaf = {};
@@ -492,6 +493,30 @@ static inline struct node_barn *get_barn(struct kmem_cache *s)
  */
 static nodemask_t slab_nodes;
 
+
+static inline
+unsigned short get_pcs_capacity(struct kmem_cache *s,
+				struct slub_percpu_sheaves *pcs)
+{
+	lockdep_assert_held(this_cpu_ptr(&s->cpu_sheaves->lock));
+	return pcs->capacity;
+}
+
+static inline void set_pcs_capacity(struct kmem_cache *s,
+				    struct slub_percpu_sheaves *pcs,
+				    unsigned short capacity)
+{
+	lockdep_assert_held(this_cpu_ptr(&s->cpu_sheaves->lock));
+	pcs->capacity = capacity;
+}
+
+static inline bool pcs_capacity_match(struct kmem_cache *s,
+				      struct slub_percpu_sheaves *pcs,
+				      struct slab_sheaf *sheaf)
+{
+	return get_pcs_capacity(s, pcs) == sheaf->capacity;
+}
+
 /*
  * Similar to slab_nodes but for where we have node_barn allocated.
  * Corresponds to N_ONLINE nodes.
@@ -507,6 +532,11 @@ struct slub_flush_work {
 	struct work_struct work;
 	struct kmem_cache *s;
 	bool skip;
+	/* for flushing sheaves */
+	bool disable_sheaves;
+	/* for enabling sheaves */
+	void **sheaves;
+	unsigned short capacity;
 };
 
 static DEFINE_MUTEX(flush_lock);
@@ -2774,6 +2804,10 @@ static struct slab_sheaf *__alloc_empty_sheaf(struct kmem_cache *s, gfp_t gfp,
 	if (gfp & __GFP_NO_OBJ_EXT)
 		return NULL;
 
+	/* Sheaves have been disabled */
+	if (!capacity)
+		return NULL;
+
 	gfp &= ~OBJCGS_CLEAR_MASK;
 
 	/*
@@ -2800,7 +2834,7 @@ static struct slab_sheaf *__alloc_empty_sheaf(struct kmem_cache *s, gfp_t gfp,
 static inline struct slab_sheaf *alloc_empty_sheaf(struct kmem_cache *s,
 						   gfp_t gfp)
 {
-	return __alloc_empty_sheaf(s, gfp, s->sheaf_capacity);
+	return __alloc_empty_sheaf(s, gfp, data_race(s->sheaf_capacity));
 }
 
 static void free_empty_sheaf(struct kmem_cache *s, struct slab_sheaf *sheaf)
@@ -2999,10 +3033,10 @@ static void rcu_free_sheaf_nobarn(struct rcu_head *head)
  * flushing operations are rare so let's keep it simple and flush to slabs
  * directly, skipping the barn
  */
-static void pcs_flush_all(struct kmem_cache *s)
+static void pcs_flush_all(struct kmem_cache *s, bool disable_sheaves)
 {
 	struct slub_percpu_sheaves *pcs;
-	struct slab_sheaf *spare, *rcu_free;
+	struct slab_sheaf *spare, *rcu_free, *main;
 
 	local_lock(&s->cpu_sheaves->lock);
 	pcs = this_cpu_ptr(s->cpu_sheaves);
@@ -3013,7 +3047,22 @@ static void pcs_flush_all(struct kmem_cache *s)
 	rcu_free = pcs->rcu_free;
 	pcs->rcu_free = NULL;
 
+	if (disable_sheaves && pcs_has_sheaves(pcs)) {
+		main = pcs->main;
+		pcs->main = &bootstrap_sheaf;
+		set_pcs_capacity(s, pcs, 0);
+	} else {
+		main = NULL;
+	}
+
 	local_unlock(&s->cpu_sheaves->lock);
+
+	if (main) {
+		sheaf_flush_unused(s, main);
+		free_empty_sheaf(s, main);
+	} else {
+		sheaf_flush_main(s);
+	}
 
 	if (spare) {
 		sheaf_flush_unused(s, spare);
@@ -3022,8 +3071,6 @@ static void pcs_flush_all(struct kmem_cache *s)
 
 	if (rcu_free)
 		call_rcu(&rcu_free->rcu_head, rcu_free_sheaf_nobarn);
-
-	sheaf_flush_main(s);
 }
 
 static void __pcs_flush_all_cpu(struct kmem_cache *s, unsigned int cpu)
@@ -3986,10 +4033,34 @@ static void flush_cpu_sheaves(struct work_struct *w)
 	s = sfw->s;
 
 	if (cache_supports_sheaves(s))
-		pcs_flush_all(s);
+		pcs_flush_all(s, sfw->disable_sheaves);
 }
 
-static void flush_all_cpus_locked(struct kmem_cache *s)
+static void enable_cpu_sheaves(struct work_struct *w)
+{
+	struct kmem_cache *s;
+	struct slub_flush_work *sfw;
+	struct slab_sheaf *sheaf;
+	struct slub_percpu_sheaves *pcs;
+
+	sfw = container_of(w, struct slub_flush_work, work);
+
+	s = sfw->s;
+
+	local_lock(&s->cpu_sheaves->lock);
+	pcs = this_cpu_ptr(s->cpu_sheaves);
+	sheaf = sfw->sheaves[smp_processor_id()];
+
+	VM_WARN_ON_ONCE(pcs->rcu_free);
+	VM_WARN_ON_ONCE(pcs->spare);
+	VM_WARN_ON_ONCE(pcs->main != &bootstrap_sheaf);
+
+	pcs->main = sheaf;
+	set_pcs_capacity(s, pcs, sfw->capacity);
+	local_unlock(&s->cpu_sheaves->lock);
+}
+
+static void flush_all_cpus_locked(struct kmem_cache *s, bool disable_sheaves)
 {
 	struct slub_flush_work *sfw;
 	unsigned int cpu;
@@ -3997,16 +4068,32 @@ static void flush_all_cpus_locked(struct kmem_cache *s)
 	lockdep_assert_cpus_held();
 	mutex_lock(&flush_lock);
 
-	for_each_online_cpu(cpu) {
+	for_each_possible_cpu(cpu) {
 		sfw = &per_cpu(slub_flush, cpu);
-		if (!has_pcs_used(cpu, s)) {
+
+		if (cpu_online(cpu)) {
+			/* Do not skip empty sheaves when disabling them */
+			if (!disable_sheaves && !has_pcs_used(cpu, s)) {
+				sfw->skip = true;
+				continue;
+			}
+			INIT_WORK(&sfw->work, flush_cpu_sheaves);
+			sfw->skip = false;
+			sfw->s = s;
+			sfw->disable_sheaves = disable_sheaves;
+			queue_work_on(cpu, flushwq, &sfw->work);
+		} else if (disable_sheaves) {
+			struct slub_percpu_sheaves *pcs;
+
 			sfw->skip = true;
-			continue;
+			pcs = per_cpu_ptr(s->cpu_sheaves, cpu);
+			if (pcs->main != &bootstrap_sheaf) {
+				sheaf_flush_unused(s, pcs->main);
+				free_empty_sheaf(s, pcs->main);
+				pcs->main = &bootstrap_sheaf;
+				pcs->capacity = 0;
+			}
 		}
-		INIT_WORK(&sfw->work, flush_cpu_sheaves);
-		sfw->skip = false;
-		sfw->s = s;
-		queue_work_on(cpu, flushwq, &sfw->work);
 	}
 
 	for_each_online_cpu(cpu) {
@@ -4019,10 +4106,10 @@ static void flush_all_cpus_locked(struct kmem_cache *s)
 	mutex_unlock(&flush_lock);
 }
 
-static void flush_all(struct kmem_cache *s)
+static void flush_all(struct kmem_cache *s, bool disable_sheaves)
 {
 	cpus_read_lock();
-	flush_all_cpus_locked(s);
+	flush_all_cpus_locked(s, disable_sheaves);
 	cpus_read_unlock();
 }
 
@@ -4690,9 +4777,20 @@ __pcs_replace_empty_main(struct kmem_cache *s, struct slub_percpu_sheaves *pcs, 
 	full = empty;
 	empty = NULL;
 
-	if (!local_trylock(&s->cpu_sheaves->lock))
-		goto barn_put;
+	if (!local_trylock(&s->cpu_sheaves->lock)) {
+		sheaf_flush_unused(s, full);
+		free_empty_sheaf(s, full);
+		return NULL;
+	}
+
 	pcs = this_cpu_ptr(s->cpu_sheaves);
+
+	if (unlikely(!pcs_capacity_match(s, pcs, full))) {
+		local_unlock(&s->cpu_sheaves->lock);
+		sheaf_flush_unused(s, full);
+		free_empty_sheaf(s, full);
+		return NULL;
+	}
 
 	/*
 	 * If we put any empty or full sheaf to the barn below, it's due to
@@ -4721,7 +4819,6 @@ __pcs_replace_empty_main(struct kmem_cache *s, struct slub_percpu_sheaves *pcs, 
 		return pcs;
 	}
 
-barn_put:
 	barn_put_full_sheaf(barn, full);
 	stat(s, BARN_PUT);
 
@@ -5027,29 +5124,8 @@ kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned short size)
 	if (unlikely(!size))
 		return NULL;
 
-	if (unlikely(size > s->sheaf_capacity)) {
-
-		sheaf = kzalloc_flex(*sheaf, objects, size, gfp);
-		if (!sheaf)
-			return NULL;
-
-		stat(s, SHEAF_PREFILL_OVERSIZE);
-		sheaf->capacity = size;
-
-		/*
-		 * we do not need to care about pfmemalloc here because oversize
-		 * sheaves area always flushed and freed when returned
-		 */
-		if (!__kmem_cache_alloc_bulk(s, gfp, size,
-					     &sheaf->objects[0])) {
-			kfree(sheaf);
-			return NULL;
-		}
-
-		sheaf->size = size;
-
-		return sheaf;
-	}
+	if (unlikely(size > data_race(s->sheaf_capacity)))
+		goto oversized;
 
 	local_lock(&s->cpu_sheaves->lock);
 	pcs = this_cpu_ptr(s->cpu_sheaves);
@@ -5072,11 +5148,16 @@ kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned short size)
 
 	local_unlock(&s->cpu_sheaves->lock);
 
-
 	if (!sheaf)
 		sheaf = alloc_empty_sheaf(s, gfp);
 
 	if (sheaf) {
+		if (size > sheaf->capacity) {
+			sheaf_flush_unused(s, sheaf);
+			free_empty_sheaf(s, sheaf);
+			sheaf = NULL;
+			goto oversized;
+		}
 		sheaf->pfmemalloc = false;
 
 		if (sheaf->size < size &&
@@ -5086,6 +5167,28 @@ kmem_cache_prefill_sheaf(struct kmem_cache *s, gfp_t gfp, unsigned short size)
 			sheaf = NULL;
 		}
 	}
+
+	return sheaf;
+
+oversized:
+	sheaf = kzalloc_flex(*sheaf, objects, size, gfp);
+	if (!sheaf)
+		return NULL;
+
+	stat(s, SHEAF_PREFILL_OVERSIZE);
+	sheaf->capacity = size;
+
+	/*
+	 * we do not need to care about pfmemalloc here because oversize
+	 * sheaves area always flushed and freed when returned
+	 */
+	if (!__kmem_cache_alloc_bulk(s, gfp, size,
+				     &sheaf->objects[0])) {
+		kfree(sheaf);
+		return NULL;
+	}
+
+	sheaf->size = size;
 
 	return sheaf;
 }
@@ -5106,27 +5209,25 @@ void kmem_cache_return_sheaf(struct kmem_cache *s, gfp_t gfp,
 	struct slub_percpu_sheaves *pcs;
 	struct node_barn *barn;
 
-	if (unlikely((sheaf->capacity != s->sheaf_capacity)
-		     || sheaf->pfmemalloc)) {
-		sheaf_flush_unused(s, sheaf);
-		kfree(sheaf);
-		return;
-	}
+	if (unlikely((sheaf->capacity != data_race(s->sheaf_capacity))
+		     || sheaf->pfmemalloc))
+		goto free_sheaf;
 
 	local_lock(&s->cpu_sheaves->lock);
 	pcs = this_cpu_ptr(s->cpu_sheaves);
 	barn = get_barn(s);
 
-	if (!pcs->spare) {
-		pcs->spare = sheaf;
-		sheaf = NULL;
-		stat(s, SHEAF_RETURN_FAST);
+	if (!pcs_capacity_match(s, pcs, sheaf)) {
+		local_unlock(&s->cpu_sheaves->lock);
+		goto free_sheaf;
 	}
 
-	local_unlock(&s->cpu_sheaves->lock);
-
-	if (!sheaf)
+	if (!pcs->spare) {
+		pcs->spare = sheaf;
+		stat(s, SHEAF_RETURN_FAST);
+		local_unlock(&s->cpu_sheaves->lock);
 		return;
+	}
 
 	stat(s, SHEAF_RETURN_SLOW);
 
@@ -5134,15 +5235,32 @@ void kmem_cache_return_sheaf(struct kmem_cache *s, gfp_t gfp,
 	 * If the barn has too many full sheaves or we fail to refill the sheaf,
 	 * simply flush and free it.
 	 */
-	if (!barn || data_race(barn->nr_full) >= MAX_FULL_SHEAVES ||
-	    refill_sheaf(s, sheaf, gfp)) {
-		sheaf_flush_unused(s, sheaf);
-		free_empty_sheaf(s, sheaf);
-		return;
+	if (!barn || data_race(barn->nr_full) >= MAX_FULL_SHEAVES) {
+		local_unlock(&s->cpu_sheaves->lock);
+		goto free_sheaf;
+	}
+
+	local_unlock(&s->cpu_sheaves->lock);
+
+	if (refill_sheaf(s, sheaf, gfp))
+		goto free_sheaf;
+
+	local_lock(&s->cpu_sheaves->lock);
+	pcs = this_cpu_ptr(s->cpu_sheaves);
+
+	if (!pcs_capacity_match(s, pcs, sheaf)) {
+		local_unlock(&s->cpu_sheaves->lock);
+		goto free_sheaf;
 	}
 
 	barn_put_full_sheaf(barn, sheaf);
+	local_unlock(&s->cpu_sheaves->lock);
 	stat(s, BARN_PUT);
+	return;
+
+free_sheaf:
+	sheaf_flush_unused(s, sheaf);
+	free_empty_sheaf(s, sheaf);
 }
 
 /*
@@ -5839,11 +5957,18 @@ alloc_empty:
 
 got_empty:
 	if (!local_trylock(&s->cpu_sheaves->lock)) {
-		barn_put_empty_sheaf(barn, empty);
+		free_empty_sheaf(s, empty);
 		return NULL;
 	}
 
 	pcs = this_cpu_ptr(s->cpu_sheaves);
+
+	if (unlikely(!pcs_capacity_match(s, pcs, empty))) {
+		local_unlock(&s->cpu_sheaves->lock);
+		free_empty_sheaf(s, empty);
+		return NULL;
+	}
+
 	__pcs_install_empty_sheaf(s, pcs, empty, barn);
 
 	return pcs;
@@ -5884,6 +6009,7 @@ static void rcu_free_sheaf(struct rcu_head *head)
 	struct slab_sheaf *sheaf;
 	struct node_barn *barn = NULL;
 	struct kmem_cache *s;
+	struct slub_percpu_sheaves *pcs;
 
 	sheaf = container_of(head, struct slab_sheaf, rcu_head);
 	if (WARN_ON_ONCE(!sheaf->size)) {
@@ -5905,11 +6031,20 @@ static void rcu_free_sheaf(struct rcu_head *head)
 	 * slab so simply flush everything.
 	 */
 	if (__rcu_free_sheaf_prepare(s, sheaf))
-		goto flush;
+		goto flush_unlocked;
 
 	barn = get_barn_node(s, sheaf->node);
 	if (!barn)
-		goto flush;
+		goto flush_unlocked;
+
+	if (!local_trylock(&s->cpu_sheaves->lock))
+		goto flush_unlocked;
+
+	pcs = this_cpu_ptr(s->cpu_sheaves);
+	if (!pcs_capacity_match(s, pcs, sheaf)) {
+		local_unlock(&s->cpu_sheaves->lock);
+		goto flush_unlocked;
+	}
 
 	/* due to slab_free_hook() */
 	if (unlikely(sheaf->size == 0))
@@ -5924,19 +6059,27 @@ static void rcu_free_sheaf(struct rcu_head *head)
 	if (data_race(barn->nr_full) < MAX_FULL_SHEAVES) {
 		stat(s, BARN_PUT);
 		barn_put_full_sheaf(barn, sheaf);
+		local_unlock(&s->cpu_sheaves->lock);
 		return;
 	}
 
-flush:
 	stat(s, BARN_PUT_FAIL);
 	sheaf_flush_unused(s, sheaf);
 
 empty:
 	if (barn && data_race(barn->nr_empty) < MAX_EMPTY_SHEAVES) {
 		barn_put_empty_sheaf(barn, sheaf);
+		local_unlock(&s->cpu_sheaves->lock);
 		return;
 	}
 
+	local_unlock(&s->cpu_sheaves->lock);
+	free_empty_sheaf(s, sheaf);
+	return;
+
+flush_unlocked:
+	stat(s, BARN_PUT_FAIL);
+	sheaf_flush_unused(s, sheaf);
 	free_empty_sheaf(s, sheaf);
 }
 
@@ -6006,11 +6149,17 @@ bool __kfree_rcu_sheaf(struct kmem_cache *s, void *obj)
 			goto fail;
 
 		if (!local_trylock(&s->cpu_sheaves->lock)) {
-			barn_put_empty_sheaf(barn, empty);
+			free_empty_sheaf(s, empty);
 			goto fail;
 		}
 
 		pcs = this_cpu_ptr(s->cpu_sheaves);
+
+		if (unlikely(!pcs_capacity_match(s, pcs, empty))) {
+			local_unlock(&s->cpu_sheaves->lock);
+			free_empty_sheaf(s, empty);
+			goto fail;
+		}
 
 		if (unlikely(pcs->rcu_free))
 			barn_put_empty_sheaf(barn, empty);
@@ -7650,6 +7799,7 @@ static int init_percpu_sheaves(struct kmem_cache *s)
 		if (!pcs->main)
 			return -ENOMEM;
 
+		pcs->capacity = s->sheaf_capacity;
 	}
 
 	return 0;
@@ -8050,7 +8200,7 @@ int __kmem_cache_shutdown(struct kmem_cache *s)
 	int node;
 	struct kmem_cache_node *n;
 
-	flush_all_cpus_locked(s);
+	flush_all_cpus_locked(s, /* disable_sheaves = */false);
 
 	/* we might have rcu sheaves in flight */
 	if (cache_supports_sheaves(s))
@@ -8334,7 +8484,7 @@ static int __kmem_cache_do_shrink(struct kmem_cache *s)
 
 int __kmem_cache_shrink(struct kmem_cache *s)
 {
-	flush_all(s);
+	flush_all(s, /* disable_sheaves = */false);
 	return __kmem_cache_do_shrink(s);
 }
 
@@ -8344,7 +8494,7 @@ static int slab_mem_going_offline_callback(void)
 
 	mutex_lock(&slab_mutex);
 	list_for_each_entry(s, &slab_caches, list) {
-		flush_all_cpus_locked(s);
+		flush_all_cpus_locked(s, /* disable_sheaves = */false);
 		__kmem_cache_do_shrink(s);
 	}
 	mutex_unlock(&slab_mutex);
@@ -8479,7 +8629,11 @@ static int bootstrap_cache_sheaves(struct kmem_cache *s,
 				   unsigned short capacity)
 {
 	struct kmem_cache_args empty_args = {};
+	struct slub_flush_work *sfw;
 	int node, cpu, err = 0;
+	void **sheaves = NULL;
+
+	lockdep_assert_cpus_held();
 
 	if (!capacity)
 		capacity = calculate_sheaf_capacity(s, &empty_args);
@@ -8490,6 +8644,9 @@ static int bootstrap_cache_sheaves(struct kmem_cache *s,
 
 	for_each_node_mask(node, slab_barn_nodes) {
 		struct node_barn *barn;
+
+		if (s->per_node[node].barn)
+			continue;
 
 		barn = kmalloc_node(sizeof(*barn), GFP_KERNEL, node);
 
@@ -8502,23 +8659,62 @@ static int bootstrap_cache_sheaves(struct kmem_cache *s,
 		s->per_node[node].barn = barn;
 	}
 
+	sheaves = kmalloc_array(nr_cpu_ids, sizeof(*sheaves),
+				GFP_KERNEL | __GFP_ZERO);
+	if (!sheaves) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	/* Do not queue the work if any of the allocations fails */
+	for_each_possible_cpu(cpu) {
+		sheaves[cpu] = __alloc_empty_sheaf(s, GFP_KERNEL, capacity);
+
+		if (!sheaves[cpu]) {
+			err = -ENOMEM;
+			goto out_free_sheaves;
+		}
+	}
+
+	mutex_lock(&flush_lock);
 	for_each_possible_cpu(cpu) {
 		struct slub_percpu_sheaves *pcs;
 
 		pcs = per_cpu_ptr(s->cpu_sheaves, cpu);
+		sfw = &per_cpu(slub_flush, cpu);
 
-		pcs->main = __alloc_empty_sheaf(s, GFP_KERNEL, capacity);
-
-		if (!pcs->main) {
-			err = -ENOMEM;
-			break;
+		if (!cpu_online(cpu) || slab_state == UP) {
+			pcs->main = sheaves[cpu];
+			pcs->capacity = capacity;
+			sfw->skip = true;
+		} else {
+			INIT_WORK(&sfw->work, enable_cpu_sheaves);
+			sfw->s = s;
+			sfw->sheaves = sheaves;
+			sfw->capacity = capacity;
+			sfw->skip = false;
+			queue_work_on(cpu, flushwq, &sfw->work);
 		}
 	}
 
-out:
-	if (!err)
-		s->sheaf_capacity = capacity;
+	for_each_online_cpu(cpu) {
+		sfw = &per_cpu(slub_flush, cpu);
+		if (sfw->skip)
+			continue;
+		flush_work(&sfw->work);
+	}
+	mutex_unlock(&flush_lock);
 
+	kfree(sheaves);
+	s->sheaf_capacity = capacity;
+	return 0;
+
+out_free_sheaves:
+	for_each_possible_cpu(cpu)
+		if (sheaves[cpu])
+			free_empty_sheaf(s, sheaves[cpu]);
+	kfree(sheaves);
+out:
 	return err;
 }
 
@@ -8533,6 +8729,7 @@ static void __init bootstrap_kmalloc_sheaves(void)
 	struct kmem_cache *s;
 	int idx;
 
+	cpus_read_lock();
 	for_each_normal_kmalloc_cache(s, type, idx) {
 		/*
 		 * It's still early in boot so treat this as a failure to
@@ -8542,6 +8739,7 @@ static void __init bootstrap_kmalloc_sheaves(void)
 			panic("Out of memory when creating kmem_cache %s\n",
 			      s->name);
 	}
+	cpus_read_unlock();
 }
 
 void __init kmem_cache_init(void)
@@ -8799,7 +8997,7 @@ long validate_slab_cache(struct kmem_cache *s)
 	if (!obj_map)
 		return -ENOMEM;
 
-	flush_all(s);
+	flush_all(s, /* disable_sheaves = */false);
 	for_each_kmem_cache_node(s, node, n)
 		count += validate_slab_node(s, n, obj_map);
 
@@ -9111,7 +9309,39 @@ static ssize_t sheaf_capacity_show(struct kmem_cache *s, char *buf)
 {
 	return sysfs_emit(buf, "%hu\n", s->sheaf_capacity);
 }
-SLAB_ATTR_RO(sheaf_capacity);
+static ssize_t sheaf_capacity_store(struct kmem_cache *s,
+				    const char *buf, size_t length)
+{
+	unsigned short capacity;
+	int err;
+
+	err = kstrtou16(buf, 10, &capacity);
+	if (err)
+		return err;
+
+	if (!cache_supports_sheaves(s))
+		return -EOPNOTSUPP;
+
+	cpus_read_lock();
+	mutex_lock(&slab_mutex);
+	flush_all_cpus_locked(s, /* disable_sheaves = */true);
+	rcu_barrier();
+	__kmem_cache_do_shrink(s);
+	s->sheaf_capacity = 0;
+	if (capacity) {
+		err = bootstrap_cache_sheaves(s, capacity);
+		if (err) {
+			mutex_unlock(&slab_mutex);
+			cpus_read_unlock();
+			return err;
+		}
+	}
+	mutex_unlock(&slab_mutex);
+	cpus_read_unlock();
+
+	return length;
+}
+SLAB_ATTR(sheaf_capacity);
 
 static ssize_t min_partial_show(struct kmem_cache *s, char *buf)
 {
