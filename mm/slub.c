@@ -8462,18 +8462,18 @@ static struct kmem_cache * __init bootstrap(struct kmem_cache *static_cache)
  * init_kmem_cache_nodes(). For normal kmalloc caches we have to bootstrap it
  * since sheaves and barns are allocated by kmalloc.
  */
-static void __init bootstrap_cache_sheaves(struct kmem_cache *s)
+static int bootstrap_cache_sheaves(struct kmem_cache *s,
+				   unsigned short capacity)
 {
 	struct kmem_cache_args empty_args = {};
-	unsigned short capacity;
-	bool failed = false;
-	int node, cpu;
+	int node, cpu, err = 0;
 
-	capacity = calculate_sheaf_capacity(s, &empty_args);
+	if (!capacity)
+		capacity = calculate_sheaf_capacity(s, &empty_args);
 
 	/* capacity can be 0 due to debugging or SLUB_TINY */
 	if (!capacity)
-		return;
+		return 0;
 
 	for_each_node_mask(node, slab_barn_nodes) {
 		struct node_barn *barn;
@@ -8481,7 +8481,7 @@ static void __init bootstrap_cache_sheaves(struct kmem_cache *s)
 		barn = kmalloc_node(sizeof(*barn), GFP_KERNEL, node);
 
 		if (!barn) {
-			failed = true;
+			err = -ENOMEM;
 			goto out;
 		}
 
@@ -8497,31 +8497,37 @@ static void __init bootstrap_cache_sheaves(struct kmem_cache *s)
 		pcs->main = __alloc_empty_sheaf(s, GFP_KERNEL, capacity);
 
 		if (!pcs->main) {
-			failed = true;
+			err = -ENOMEM;
 			break;
 		}
 	}
 
 out:
-	/*
-	 * It's still early in boot so treat this like same as a failure to
-	 * create the kmalloc cache in the first place
-	 */
-	if (failed)
-		panic("Out of memory when creating kmem_cache %s\n", s->name);
+	if (!err)
+		s->sheaf_capacity = capacity;
 
-	s->sheaf_capacity = capacity;
+	return err;
 }
+
+#define for_each_normal_kmalloc_cache(s, type, idx) \
+	for (type = KMALLOC_NORMAL; type <= KMALLOC_RANDOM_END; type++)	\
+		for (idx = 0; idx < KMALLOC_SHIFT_HIGH + 1; idx++)	\
+			if ((s = kmalloc_caches[type][idx]))
 
 static void __init bootstrap_kmalloc_sheaves(void)
 {
 	enum kmalloc_cache_type type;
+	struct kmem_cache *s;
+	int idx;
 
-	for (type = KMALLOC_NORMAL; type <= KMALLOC_RANDOM_END; type++) {
-		for (int idx = 0; idx < KMALLOC_SHIFT_HIGH + 1; idx++) {
-			if (kmalloc_caches[type][idx])
-				bootstrap_cache_sheaves(kmalloc_caches[type][idx]);
-		}
+	for_each_normal_kmalloc_cache(s, type, idx) {
+		/*
+		 * It's still early in boot so treat this as a failure to
+		 * create the kmalloc cache in the first place.
+		 */
+		if (bootstrap_cache_sheaves(s, 0))
+			panic("Out of memory when creating kmem_cache %s\n",
+			      s->name);
 	}
 }
 
