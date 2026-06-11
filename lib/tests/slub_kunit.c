@@ -8,6 +8,7 @@
 #include <linux/rcupdate.h>
 #include <linux/delay.h>
 #include <linux/perf_event.h>
+#include <linux/kprobes.h>
 #include "../mm/slab.h"
 
 static struct kunit_resource resource;
@@ -292,7 +293,8 @@ static void test_krealloc_redzone_zeroing(struct kunit *test)
 	kmem_cache_destroy(s);
 }
 
-#ifdef CONFIG_PERF_EVENTS
+#if defined(CONFIG_PERF_EVENTS) || (defined(CONFIG_KPROBES) && defined(CONFIG_SMP))
+#define SLUB_KUNIT_TEST_KMALLOC_KFREE_NOLOCK
 #define NR_ITERATIONS 1000
 #define NR_OBJECTS 1000
 static void *objects[NR_OBJECTS];
@@ -302,9 +304,12 @@ struct test_nolock_context {
 	int callback_count;
 	int alloc_ok;
 	int alloc_fail;
+#ifdef CONFIG_PERF_EVENTS
 	struct perf_event *event;
+#endif
 };
 
+#ifdef CONFIG_PERF_EVENTS
 static struct perf_event_attr hw_attr = {
 	.type = PERF_TYPE_HARDWARE,
 	.config = PERF_COUNT_HW_CPU_CYCLES,
@@ -374,15 +379,65 @@ static void disable_perf_events(struct test_nolock_context *ctx)
 	perf_event_disable(ctx->event);
 	perf_event_release_kernel(ctx->event);
 }
+#else
+static bool enable_perf_events(struct test_nolock_context *ctx) { return false; }
+static void disable_perf_events(struct test_nolock_context *ctx) { }
+#endif
+
+#if defined(CONFIG_KPROBES) && defined(CONFIG_SMP)
+static int slab_kprobe_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+	struct test_kfree_rcu_struct *objp;
+
+	objp = kmalloc_nolock(sizeof(*objp), 0, NUMA_NO_NODE);
+	if (objp)
+		kfree_nolock(objp);
+
+	objp = kmalloc_nolock(sizeof(*objp), __GFP_ACCOUNT, NUMA_NO_NODE);
+	if (objp)
+		kfree_nolock(objp);
+
+	return 0;
+}
+
+static struct kprobe slab_kprobe = {
+	.symbol_name = "slab_attach_kprobe_locked",
+	.pre_handler = slab_kprobe_pre_handler,
+};
+
+static bool register_slab_kprobes(void)
+{
+	if (register_kprobe(&slab_kprobe))
+		return false;
+	return true;
+}
+
+static void unregister_slab_kprobes(void)
+{
+	unregister_kprobe(&slab_kprobe);
+}
+#else
+static bool register_slab_kprobes(void) { return false; }
+static void unregister_slab_kprobes(void) { }
+#endif
 
 static void test_kmalloc_kfree_nolock(struct kunit *test)
 {
 	int i, j;
 	struct test_nolock_context ctx = { .test = test };
 	bool alloc_fail = false;
+	bool perf_events_enabled;
+	bool slab_kprobes_enabled;
 
-	if (!enable_perf_events(&ctx))
-		kunit_skip(test, "Failed to create perf event");
+	perf_events_enabled = enable_perf_events(&ctx);
+	slab_kprobes_enabled = register_slab_kprobes();
+
+	if (!perf_events_enabled && !slab_kprobes_enabled)
+		kunit_skip(test, "Failed to enable perf event and kprobe, skipping");
+	else if (!perf_events_enabled)
+		kunit_info(test, "Failed to create perf event");
+	if (!slab_kprobes_enabled)
+		kunit_info(test, "Failed to register kprobe");
 
 	for (i = 0; i < NR_ITERATIONS; i++) {
 		for (j = 0; j < NR_OBJECTS; j++) {
@@ -402,7 +457,10 @@ static void test_kmalloc_kfree_nolock(struct kunit *test)
 	}
 
 cleanup:
-	disable_perf_events(&ctx);
+	if (perf_events_enabled)
+		disable_perf_events(&ctx);
+	if (slab_kprobes_enabled)
+		unregister_slab_kprobes();
 
 	kunit_info(test, "callback_count: %d, alloc_ok: %d, alloc_fail: %d\n",
 		   ctx.callback_count, ctx.alloc_ok, ctx.alloc_fail);
@@ -437,7 +495,7 @@ static struct kunit_case test_cases[] = {
 	KUNIT_CASE(test_kfree_rcu_wq_destroy),
 	KUNIT_CASE(test_leak_destroy),
 	KUNIT_CASE(test_krealloc_redzone_zeroing),
-#ifdef CONFIG_PERF_EVENTS
+#ifdef SLUB_KUNIT_TEST_KMALLOC_KFREE_NOLOCK
 	KUNIT_CASE_SLOW(test_kmalloc_kfree_nolock),
 #endif
 	{}
