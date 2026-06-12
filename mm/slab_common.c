@@ -1263,6 +1263,23 @@ EXPORT_TRACEPOINT_SYMBOL(kmem_cache_alloc);
 EXPORT_TRACEPOINT_SYMBOL(kfree);
 EXPORT_TRACEPOINT_SYMBOL(kmem_cache_free);
 
+void kfree_call_rcu_nolock(struct rcu_head *head, void *ptr)
+{
+	struct slab *slab;
+	struct kmem_cache *s;
+
+	VM_WARN_ON_ONCE(is_vmalloc_addr(ptr) || !virt_to_slab(ptr));
+
+	slab = virt_to_slab(ptr);
+	s = slab->slab_cache;
+
+	if (__kfree_rcu_sheaf(s, ptr, /* allow_spin = */ false))
+		return;
+
+	defer_kfree_rcu(head);
+}
+EXPORT_SYMBOL_GPL(kfree_call_rcu_nolock);
+
 #ifndef CONFIG_KVFREE_RCU_BATCHED
 
 void kvfree_call_rcu(struct rcu_head *head, void *ptr)
@@ -2119,11 +2136,12 @@ void kvfree_rcu_barrier_on_cache(struct kmem_cache *s)
 	if (cache_has_sheaves(s)) {
 		cpus_read_lock();
 		flush_rcu_sheaves_on_cache(s);
-		deferred_work_barrier();
 		cpus_read_unlock();
-		rcu_barrier();
 	}
 
+	/* kfree_rcu_nolock() might have deferred frees even without sheaves */
+	deferred_work_barrier();
+	rcu_barrier();
 	__kvfree_rcu_barrier();
 }
 EXPORT_SYMBOL_GPL(kvfree_rcu_barrier_on_cache);
