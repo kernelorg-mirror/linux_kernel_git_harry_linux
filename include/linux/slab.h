@@ -58,7 +58,10 @@ enum _slab_flag_bits {
 #endif
 	_SLAB_OBJECT_POISON,
 	_SLAB_CMPXCHG_DOUBLE,
+#ifdef CONFIG_SLAB_OBJ_EXT
 	_SLAB_NO_OBJ_EXT,
+#endif
+	_SLAB_NO_SHEAVES,
 #if defined(CONFIG_SLAB_OBJ_EXT) && defined(CONFIG_64BIT)
 	_SLAB_OBJ_EXT_IN_OBJ,
 #endif
@@ -172,7 +175,11 @@ enum _slab_flag_bits {
 # define SLAB_DEBUG_OBJECTS	__SLAB_FLAG_UNUSED
 #endif
 
-/* Avoid kmemleak tracing */
+/* 
+ * Avoid kmemleak tracing. SLAB_NOLEAKTRACE caches must not have sheaves
+ * and obj_exts to avoid recursion when those allocations trigger kmemleak
+ * tracking. SLAB_NOLEAKTRACE implies SLAB_NO_SHEAVES and SLAB_NO_OBJ_EXT.
+ */
 #define SLAB_NOLEAKTRACE	__SLAB_FLAG_BIT(_SLAB_NOLEAKTRACE)
 
 /*
@@ -239,8 +246,14 @@ enum _slab_flag_bits {
 #endif
 #define SLAB_TEMPORARY		SLAB_RECLAIM_ACCOUNT	/* Objects are short-lived */
 
-/* Slab created using create_boot_cache */
+/* Slab caches without obj_exts array */
+#ifdef CONFIG_SLAB_OBJ_EXT
 #define SLAB_NO_OBJ_EXT		__SLAB_FLAG_BIT(_SLAB_NO_OBJ_EXT)
+#else
+#define SLAB_NO_OBJ_EXT		__SLAB_FLAG_UNUSED
+#endif
+
+#define SLAB_NO_SHEAVES		__SLAB_FLAG_BIT(_SLAB_NO_SHEAVES)
 
 #if defined(CONFIG_SLAB_OBJ_EXT) && defined(CONFIG_64BIT)
 #define SLAB_OBJ_EXT_IN_OBJ	__SLAB_FLAG_BIT(_SLAB_OBJ_EXT_IN_OBJ)
