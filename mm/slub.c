@@ -7895,17 +7895,19 @@ static unsigned int calculate_sheaf_capacity(struct kmem_cache *s,
 	else
 		capacity = 60;
 
-	/* Increment capacity to make sheaf exactly a kmalloc size bucket */
-	size = struct_size_t(struct slab_sheaf, objects, capacity);
-	size = kmalloc_size_roundup(size);
-	capacity = (size - struct_size_t(struct slab_sheaf, objects, 0)) / sizeof(void *);
-
 	/*
 	 * Respect an explicit request for capacity that's typically motivated by
 	 * expected maximum size of kmem_cache_prefill_sheaf() to not end up
 	 * using low-performance oversize sheaves
 	 */
-	return max(capacity, args->sheaf_capacity);
+	capacity = max(capacity, args->sheaf_capacity);
+
+	/* Increment capacity to make sheaf exactly a kmalloc size bucket */
+	size = struct_size_t(struct slab_sheaf, objects, capacity);
+	size = kmalloc_size_roundup(size);
+	capacity = (size - struct_size_t(struct slab_sheaf, objects, 0)) / sizeof(void *);
+
+	return capacity;
 }
 
 /*
